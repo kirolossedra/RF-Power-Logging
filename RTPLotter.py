@@ -11,6 +11,7 @@ from datetime import datetime
 import numpy as np
 import serial
 from serial.tools import list_ports
+from openpyxl import Workbook
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -411,10 +412,50 @@ class RTPlotter:
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "capture command failed")
 
+    def _save_sweep_excel(self, filepath_base, freq, power, maxhold):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "SweepData"
+
+        sheet["A1"] = "Frequency_Hz"
+        sheet["B1"] = "Power_dBm"
+        sheet["C1"] = "MaxHold_dBm"
+        sheet["D1"] = "Export_Timestamp"
+        sheet["E1"] = "Scan_Count"
+
+        export_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for idx, f in enumerate(freq, start=2):
+            sheet.cell(row=idx, column=1, value=float(f))
+            sheet.cell(row=idx, column=2, value=float(power[idx - 2]))
+            if maxhold is not None and len(maxhold) == len(freq):
+                sheet.cell(row=idx, column=3, value=float(maxhold[idx - 2]))
+            sheet.cell(row=idx, column=4, value=export_time)
+            sheet.cell(row=idx, column=5, value=int(self.scan_count))
+
+        sheet.column_dimensions["A"].width = 18
+        sheet.column_dimensions["B"].width = 14
+        sheet.column_dimensions["C"].width = 14
+        sheet.column_dimensions["D"].width = 22
+        sheet.column_dimensions["E"].width = 12
+
+        excel_path = filepath_base + ".xlsx"
+        workbook.save(excel_path)
+        return excel_path
+
     def take_snapshot(self):
         try:
             self.root.update_idletasks()
             self.root.update()
+
+            with self.data_lock:
+                freq = None if self.freq is None else self.freq.copy()
+                power = None if self.power is None else self.power.copy()
+                maxhold = None if self.maxhold is None else self.maxhold.copy()
+                scan_count = self.scan_count
+
+            if freq is None or power is None:
+                raise RuntimeError("No sweep data available yet")
 
             x = int(self.root.winfo_rootx())
             y = int(self.root.winfo_rooty())
@@ -425,8 +466,8 @@ class RTPlotter:
                 raise RuntimeError("Invalid window size")
 
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            filename = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            filepath = os.path.join(script_dir, filename)
+            base_name = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            image_path = os.path.join(script_dir, base_name + ".png")
 
             errors = []
 
@@ -436,9 +477,17 @@ class RTPlotter:
                         "import",
                         "-window", "root",
                         "-crop", f"{w}x{h}+{x}+{y}",
-                        filepath
+                        image_path
                     ])
-                    self.status.set(f"Snapshot saved: {filepath}")
+                    excel_path = self._save_sweep_excel(
+                        os.path.join(script_dir, base_name),
+                        freq,
+                        power,
+                        maxhold
+                    )
+                    self.status.set(
+                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
+                    )
                     return
                 except Exception as e:
                     errors.append(f"import: {e}")
@@ -448,11 +497,16 @@ class RTPlotter:
                     self._run_capture_command([
                         "gnome-screenshot",
                         "-f",
-                        filepath
+                        image_path
                     ])
+                    excel_path = self._save_sweep_excel(
+                        os.path.join(script_dir, base_name),
+                        freq,
+                        power,
+                        maxhold
+                    )
                     self.status.set(
-                        f"Snapshot saved full screen to {filepath} "
-                        f"(gnome-screenshot cannot reliably crop this window in all setups)"
+                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
                     )
                     return
                 except Exception as e:
@@ -464,9 +518,17 @@ class RTPlotter:
                         "grim",
                         "-g",
                         f"{x},{y} {w}x{h}",
-                        filepath
+                        image_path
                     ])
-                    self.status.set(f"Snapshot saved: {filepath}")
+                    excel_path = self._save_sweep_excel(
+                        os.path.join(script_dir, base_name),
+                        freq,
+                        power,
+                        maxhold
+                    )
+                    self.status.set(
+                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
+                    )
                     return
                 except Exception as e:
                     errors.append(f"grim: {e}")
@@ -478,11 +540,16 @@ class RTPlotter:
                         "-b",
                         "-n",
                         "-o",
-                        filepath
+                        image_path
                     ])
+                    excel_path = self._save_sweep_excel(
+                        os.path.join(script_dir, base_name),
+                        freq,
+                        power,
+                        maxhold
+                    )
                     self.status.set(
-                        f"Snapshot saved full screen to {filepath} "
-                        f"(spectacle fallback)"
+                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
                     )
                     return
                 except Exception as e:
