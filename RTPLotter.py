@@ -4,8 +4,6 @@ import os
 import time
 import struct
 import threading
-import shutil
-import subprocess
 from datetime import datetime
 
 import numpy as np
@@ -20,6 +18,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.backends.backend_pdf import PdfPages
 
 
 VID = 0x0483
@@ -31,6 +30,17 @@ def getport():
         if device.vid == VID and device.pid == PID:
             return device.device
     raise OSError("tinySA not found")
+
+
+def format_dt(dt_obj):
+    return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sanitize_sheet_name(name):
+    invalid = ['\\', '/', '*', '?', ':', '[', ']']
+    for ch in invalid:
+        name = name.replace(ch, "_")
+    return name[:31]
 
 
 class TinySA:
@@ -125,8 +135,8 @@ class TinySA:
 
             arr = np.array(data, dtype=np.uint16)
 
-            SCALE = 128
-            power = arr / 32 - SCALE
+            scale = 128
+            power = arr / 32 - scale
 
             try:
                 self.ser.timeout = 1
@@ -149,7 +159,6 @@ class RTPlotter:
         self.tiny = None
 
         self.data_lock = threading.Lock()
-        self.maxhold = None
         self.freq = None
         self.power = None
         self.scan_count = 0
@@ -158,6 +167,15 @@ class RTPlotter:
         self.f_high = None
         self.num_points = None
         self.rbw_value = None
+
+        self.auto_run_folder = None
+        self.auto_run_started_at = None
+        self.last_sweep_duration = None
+        self.completed_sweep_durations = []
+
+        self.auto_excel_path = None
+        self.auto_pdf_path = None
+        self.auto_records = []
 
         self.build_gui()
         self.build_plot()
@@ -182,28 +200,36 @@ class RTPlotter:
         self.rbw = tk.StringVar(value="0")
         ttk.Entry(frame, textvariable=self.rbw, width=8).grid(row=0, column=7, padx=3, pady=3)
 
-        ttk.Label(frame, text="Mode").grid(row=1, column=0, padx=3, pady=3)
-        self.mode = tk.StringVar(value="Raw")
+        ttk.Label(frame, text="Run Mode").grid(row=1, column=0, padx=3, pady=3)
+        self.run_mode = tk.StringVar(value="Continuous Live")
         ttk.Combobox(
             frame,
-            textvariable=self.mode,
-            values=["Raw", "Max Hold"],
+            textvariable=self.run_mode,
+            values=["Continuous Live", "Automatic Sweep Mode"],
             state="readonly",
-            width=10
+            width=20
         ).grid(row=1, column=1, padx=3, pady=3)
+
+        ttk.Label(frame, text="Sweeps").grid(row=1, column=2, padx=3, pady=3)
+        self.auto_sweeps = tk.StringVar(value="5")
+        ttk.Entry(frame, textvariable=self.auto_sweeps, width=8).grid(row=1, column=3, padx=3, pady=3)
+
+        ttk.Label(frame, text="Wait(s)").grid(row=1, column=4, padx=3, pady=3)
+        self.wait_between_sweeps = tk.StringVar(value="2")
+        ttk.Entry(frame, textvariable=self.wait_between_sweeps, width=8).grid(row=1, column=5, padx=3, pady=3)
 
         self.port = tk.StringVar()
 
-        ttk.Button(frame, text="Auto Detect", command=self.detect).grid(row=1, column=2, padx=3, pady=3)
+        ttk.Button(frame, text="Auto Detect", command=self.detect).grid(row=2, column=0, padx=3, pady=3)
 
         self.start_btn = ttk.Button(frame, text="Start", command=self.start_scan)
-        self.start_btn.grid(row=1, column=3, padx=3, pady=3)
+        self.start_btn.grid(row=2, column=1, padx=3, pady=3)
 
         self.stop_btn = ttk.Button(frame, text="Stop", command=self.stop_scan, state=tk.DISABLED)
-        self.stop_btn.grid(row=1, column=4, padx=3, pady=3)
+        self.stop_btn.grid(row=2, column=2, padx=3, pady=3)
 
-        ttk.Button(frame, text="Reset MaxHold", command=self.reset_max).grid(row=1, column=5, padx=3, pady=3)
-        ttk.Button(frame, text="Snapshot", command=self.take_snapshot).grid(row=1, column=6, padx=3, pady=3)
+        ttk.Button(frame, text="Snapshot", command=self.take_snapshot).grid(row=2, column=3, padx=3, pady=3)
+        ttk.Button(frame, text="Estimate Auto Time", command=self.show_estimate).grid(row=2, column=4, padx=3, pady=3)
 
         self.status = tk.StringVar(value="Idle")
         ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN, anchor="w").pack(fill=tk.X)
@@ -212,10 +238,9 @@ class RTPlotter:
         self.fig = Figure(figsize=(10, 5))
         self.ax = self.fig.add_subplot(111)
 
-        self.raw_line, = self.ax.plot([], [], label="Raw")
-        self.max_line, = self.ax.plot([], [], label="Max Hold")
+        self.raw_line, = self.ax.plot([], [], label="Sweep")
 
-        self.ax.set_xlabel("Frequency")
+        self.ax.set_xlabel("Frequency (Hz)")
         self.ax.set_ylabel("dBm")
         self.ax.grid(True)
         self.ax.legend()
@@ -231,19 +256,18 @@ class RTPlotter:
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def reset_max(self):
-        with self.data_lock:
-            self.maxhold = None
-
     def clear_plot_data(self):
         with self.data_lock:
-            self.maxhold = None
             self.freq = None
             self.power = None
             self.scan_count = 0
+            self.last_sweep_duration = None
+            self.completed_sweep_durations = []
+            self.auto_records = []
+            self.auto_excel_path = None
+            self.auto_pdf_path = None
 
         self.raw_line.set_data([], [])
-        self.max_line.set_data([], [])
         self.canvas.draw_idle()
 
     def parse_inputs(self):
@@ -262,12 +286,24 @@ class RTPlotter:
 
         return port, f_low, f_high, num_points, rbw_value
 
+    def parse_auto_inputs(self):
+        total_sweeps = int(self.auto_sweeps.get())
+        wait_seconds = float(self.wait_between_sweeps.get())
+
+        if total_sweeps < 1:
+            raise ValueError("Sweeps must be at least 1")
+        if wait_seconds < 0:
+            raise ValueError("Wait time must be 0 or positive")
+
+        return total_sweeps, wait_seconds
+
     def start_scan(self):
         if self.running:
             self.stop_scan()
 
         try:
             port, self.f_low, self.f_high, self.num_points, self.rbw_value = self.parse_inputs()
+            total_sweeps, wait_seconds = self.parse_auto_inputs()
         except Exception as e:
             messagebox.showerror("Input Error", str(e))
             return
@@ -287,9 +323,20 @@ class RTPlotter:
         self.running = True
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.status.set("Scanning...")
 
-        self.worker = threading.Thread(target=self.loop, daemon=True)
+        run_mode = self.run_mode.get()
+
+        if run_mode == "Automatic Sweep Mode":
+            self.status.set("Automatic sweep mode running...")
+            self.worker = threading.Thread(
+                target=self.auto_sweep_loop,
+                args=(total_sweeps, wait_seconds),
+                daemon=True
+            )
+        else:
+            self.status.set("Scanning...")
+            self.worker = threading.Thread(target=self.live_loop, daemon=True)
+
         self.worker.start()
 
     def stop_scan(self):
@@ -315,7 +362,17 @@ class RTPlotter:
         self.stop_btn.config(state=tk.DISABLED)
         self.status.set("Stopped")
 
-    def loop(self):
+    def update_data_after_sweep(self, power, duration_seconds):
+        with self.data_lock:
+            self.power = power.copy()
+            self.scan_count += 1
+            self.last_sweep_duration = duration_seconds
+            self.completed_sweep_durations.append(duration_seconds)
+            count = self.scan_count
+
+        return count
+
+    def live_loop(self):
         while not self.stop_event.is_set():
             try:
                 tiny = self.tiny
@@ -323,7 +380,6 @@ class RTPlotter:
                     break
 
                 t0 = time.time()
-
                 power = tiny.scan(
                     self.f_low,
                     self.f_high,
@@ -336,19 +392,14 @@ class RTPlotter:
                     break
 
                 dt = time.time() - t0
+                count = self.update_data_after_sweep(power, dt)
 
-                with self.data_lock:
-                    self.power = power
-
-                    if self.maxhold is None:
-                        self.maxhold = power.copy()
-                    else:
-                        self.maxhold = np.maximum(self.maxhold, power)
-
-                    self.scan_count += 1
-                    count = self.scan_count
-
-                self.root.after(0, lambda c=count, d=dt: self.status.set(f"scan {c}  {d:.2f}s"))
+                self.root.after(
+                    0,
+                    lambda c=count, d=dt: self.status.set(
+                        f"live sweep {c} finished in {d:.2f}s"
+                    )
+                )
 
             except Exception as e:
                 if self.stop_event.is_set():
@@ -364,34 +415,387 @@ class RTPlotter:
                 self.root.after(0, handle_error)
                 break
 
+    def create_run_folder(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = os.path.join(script_dir, timestamp)
+        os.makedirs(folder, exist_ok=True)
+        self.auto_run_folder = folder
+        self.auto_run_started_at = timestamp
+        self.auto_excel_path = os.path.join(folder, f"{timestamp}_sweeps.xlsx")
+        self.auto_pdf_path = os.path.join(folder, f"{timestamp}_sweeps_report.pdf")
+        return folder, timestamp
+
+    def save_sweep_image(self, folder, sweep_index, freq, power, sweep_start_dt, sweep_end_dt):
+        image_name = f"sweep_{sweep_index:03d}_{sweep_start_dt.strftime('%Y%m%d_%H%M%S')}.png"
+        image_path = os.path.join(folder, image_name)
+
+        fig = Figure(figsize=(10, 5))
+        ax = fig.add_subplot(111)
+
+        ax.plot(freq, power, label="Sweep")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("dBm")
+        ax.set_title(
+            f"Sweep {sweep_index} | Start: {format_dt(sweep_start_dt)} | End: {format_dt(sweep_end_dt)}"
+        )
+        ax.grid(True)
+        ax.legend()
+
+        fig.tight_layout()
+        fig.savefig(image_path, dpi=150)
+        return image_path
+
+    def build_workbook(self):
+        workbook = Workbook()
+
+        summary = workbook.active
+        summary.title = "Summary"
+        summary["A1"] = "Sweep_Index"
+        summary["B1"] = "Start_Time"
+        summary["C1"] = "End_Time"
+        summary["D1"] = "Duration_s"
+        summary["E1"] = "Image_File"
+
+        return workbook
+
+    def add_sweep_sheet(self, workbook, sweep_index, freq, power, sweep_start_dt, sweep_end_dt, duration_seconds, wait_seconds):
+        sheet_name = sanitize_sheet_name(f"Sweep_{sweep_index}")
+        sheet = workbook.create_sheet(title=sheet_name)
+
+        sheet["A1"] = "Sweep_Index"
+        sheet["B1"] = sweep_index
+
+        sheet["A2"] = "Start_Time"
+        sheet["B2"] = format_dt(sweep_start_dt)
+
+        sheet["A3"] = "End_Time"
+        sheet["B3"] = format_dt(sweep_end_dt)
+
+        sheet["A4"] = "Sweep_Duration_s"
+        sheet["B4"] = float(duration_seconds)
+
+        sheet["A5"] = "Wait_Between_Sweeps_s"
+        sheet["B5"] = float(wait_seconds)
+
+        sheet["A7"] = "Frequency_Hz"
+        sheet["B7"] = "Power_dBm"
+
+        for idx, f in enumerate(freq, start=8):
+            sheet.cell(row=idx, column=1, value=float(f))
+            sheet.cell(row=idx, column=2, value=float(power[idx - 8]))
+
+        sheet.column_dimensions["A"].width = 20
+        sheet.column_dimensions["B"].width = 24
+
+    def update_summary_sheet(self, workbook, records):
+        if "Summary" not in workbook.sheetnames:
+            return
+
+        sheet = workbook["Summary"]
+
+        max_existing_rows = sheet.max_row
+        if max_existing_rows > 1:
+            sheet.delete_rows(2, max_existing_rows - 1)
+
+        for row_idx, record in enumerate(records, start=2):
+            sheet.cell(row=row_idx, column=1, value=int(record["index"]))
+            sheet.cell(row=row_idx, column=2, value=record["start"])
+            sheet.cell(row=row_idx, column=3, value=record["end"])
+            sheet.cell(row=row_idx, column=4, value=float(record["duration"]))
+            sheet.cell(row=row_idx, column=5, value=os.path.basename(record["image_path"]))
+
+        for col in ["A", "B", "C", "D", "E"]:
+            sheet.column_dimensions[col].width = 24
+
+    def save_summary_pdf(self, pdf_path, records, run_started_at, run_finished_at, freq):
+        with PdfPages(pdf_path) as pdf:
+            summary_fig = Figure(figsize=(11.69, 8.27))
+            ax = summary_fig.add_subplot(111)
+            ax.axis("off")
+
+            title_lines = [
+                "Automatic Sweep Report",
+                f"Run folder: {os.path.basename(os.path.dirname(pdf_path))}",
+                f"Run started: {format_dt(run_started_at)}",
+                f"Run finished: {format_dt(run_finished_at)}",
+                f"Frequency range: {freq[0]:.0f} Hz to {freq[-1]:.0f} Hz",
+                f"Total sweeps saved: {len(records)}",
+            ]
+
+            y = 0.95
+            for line in title_lines:
+                ax.text(0.03, y, line, fontsize=12, va="top")
+                y -= 0.055
+
+            y -= 0.02
+            ax.text(0.03, y, "Sweep Summary", fontsize=12, va="top")
+            y -= 0.05
+
+            header = f"{'Sweep':<8}{'Start Time':<24}{'End Time':<24}{'Duration (s)':<14}"
+            ax.text(0.03, y, header, family="monospace", fontsize=10, va="top")
+            y -= 0.035
+
+            for record in records:
+                line = (
+                    f"{record['index']:<8}"
+                    f"{record['start']:<24}"
+                    f"{record['end']:<24}"
+                    f"{record['duration']:<14.2f}"
+                )
+                ax.text(0.03, y, line, family="monospace", fontsize=9, va="top")
+                y -= 0.03
+
+                if y < 0.06:
+                    pdf.savefig(summary_fig)
+                    summary_fig = Figure(figsize=(11.69, 8.27))
+                    ax = summary_fig.add_subplot(111)
+                    ax.axis("off")
+                    y = 0.95
+
+            summary_fig.tight_layout()
+            pdf.savefig(summary_fig)
+
+            for record in records:
+                fig = Figure(figsize=(11.69, 8.27))
+                ax = fig.add_subplot(111)
+
+                ax.plot(record["freq"], record["power"], label="Sweep")
+                ax.set_xlabel("Frequency (Hz)")
+                ax.set_ylabel("dBm")
+                ax.set_title(
+                    f"Sweep {record['index']} | Start: {record['start']} | End: {record['end']}"
+                )
+                ax.grid(True)
+                ax.legend()
+                fig.tight_layout()
+                pdf.savefig(fig)
+
+    def save_incremental_outputs(self, workbook, records, run_started_dt, run_finished_dt):
+        if not records or self.auto_excel_path is None or self.auto_pdf_path is None:
+            return
+
+        self.update_summary_sheet(workbook, records)
+        workbook.save(self.auto_excel_path)
+        self.save_summary_pdf(
+            pdf_path=self.auto_pdf_path,
+            records=records,
+            run_started_at=run_started_dt,
+            run_finished_at=run_finished_dt,
+            freq=records[0]["freq"]
+        )
+
+    def auto_sweep_loop(self, total_sweeps, wait_seconds):
+        workbook = None
+        records = []
+        folder = None
+        run_started_dt = datetime.now()
+
+        try:
+            tiny = self.tiny
+            if tiny is None:
+                raise RuntimeError("tinySA not initialized")
+
+            folder, run_stamp = self.create_run_folder()
+
+            workbook = self.build_workbook()
+
+            for sweep_idx in range(1, total_sweeps + 1):
+                if self.stop_event.is_set():
+                    break
+
+                sweep_start_dt = datetime.now()
+                t0 = time.time()
+
+                power = tiny.scan(
+                    self.f_low,
+                    self.f_high,
+                    self.num_points,
+                    self.rbw_value,
+                    stop_event=self.stop_event
+                )
+
+                if self.stop_event.is_set():
+                    break
+
+                duration_seconds = time.time() - t0
+                sweep_end_dt = datetime.now()
+
+                count = self.update_data_after_sweep(power, duration_seconds)
+
+                with self.data_lock:
+                    freq = None if self.freq is None else self.freq.copy()
+
+                if freq is None:
+                    raise RuntimeError("Frequency axis is not initialized")
+
+                image_path = self.save_sweep_image(
+                    folder=folder,
+                    sweep_index=sweep_idx,
+                    freq=freq,
+                    power=power,
+                    sweep_start_dt=sweep_start_dt,
+                    sweep_end_dt=sweep_end_dt
+                )
+
+                self.add_sweep_sheet(
+                    workbook=workbook,
+                    sweep_index=sweep_idx,
+                    freq=freq,
+                    power=power,
+                    sweep_start_dt=sweep_start_dt,
+                    sweep_end_dt=sweep_end_dt,
+                    duration_seconds=duration_seconds,
+                    wait_seconds=wait_seconds
+                )
+
+                avg_duration = sum(self.completed_sweep_durations) / len(self.completed_sweep_durations)
+                remaining_sweeps = total_sweeps - sweep_idx
+                estimated_remaining_seconds = remaining_sweeps * avg_duration + remaining_sweeps * wait_seconds
+
+                records.append({
+                    "index": sweep_idx,
+                    "start": format_dt(sweep_start_dt),
+                    "end": format_dt(sweep_end_dt),
+                    "duration": duration_seconds,
+                    "freq": freq.copy(),
+                    "power": power.copy(),
+                    "image_path": image_path,
+                })
+
+                with self.data_lock:
+                    self.auto_records = list(records)
+
+                self.save_incremental_outputs(
+                    workbook=workbook,
+                    records=records,
+                    run_started_dt=run_started_dt,
+                    run_finished_dt=sweep_end_dt
+                )
+
+                self.root.after(
+                    0,
+                    lambda i=sweep_idx, n=total_sweeps, d=duration_seconds,
+                           avg=avg_duration, rem=estimated_remaining_seconds, c=count: self.status.set(
+                        f"auto sweep {i}/{n} finished in {d:.2f}s | avg {avg:.2f}s | remaining ~{rem:.2f}s | scan {c}"
+                    )
+                )
+
+                if sweep_idx < total_sweeps:
+                    wait_start = time.time()
+                    while True:
+                        if self.stop_event.is_set():
+                            break
+
+                        elapsed = time.time() - wait_start
+                        remaining = wait_seconds - elapsed
+                        if remaining <= 0:
+                            break
+
+                        time.sleep(min(0.1, remaining))
+
+                    if self.stop_event.is_set():
+                        break
+
+            run_finished_dt = datetime.now()
+
+            if workbook is not None and records:
+                self.save_incremental_outputs(
+                    workbook=workbook,
+                    records=records,
+                    run_started_dt=run_started_dt,
+                    run_finished_dt=run_finished_dt
+                )
+
+                self.root.after(
+                    0,
+                    lambda: self.status.set(
+                        f"Automatic sweep mode finished | folder: {folder} | PDF: {os.path.basename(self.auto_pdf_path)} | Excel: {os.path.basename(self.auto_excel_path)}"
+                    )
+                )
+            elif folder is not None:
+                self.root.after(
+                    0,
+                    lambda: self.status.set(
+                        f"Automatic sweep mode stopped before first saved sweep | folder: {folder}"
+                    )
+                )
+
+        except Exception as e:
+            if self.stop_event.is_set():
+                return
+
+            err = str(e)
+
+            def handle_error():
+                self.status.set(f"Error: {err}")
+                self.stop_scan()
+                messagebox.showerror("Automatic Sweep Error", err)
+
+            self.root.after(0, handle_error)
+            return
+
+        finally:
+            self.root.after(0, self.finish_worker_state)
+
+    def finish_worker_state(self):
+        self.running = False
+
+        tiny = self.tiny
+        self.tiny = None
+        if tiny is not None:
+            try:
+                tiny.close()
+            except Exception:
+                pass
+
+        self.worker = None
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+
+    def show_estimate(self):
+        try:
+            total_sweeps, wait_seconds = self.parse_auto_inputs()
+
+            with self.data_lock:
+                durations = self.completed_sweep_durations.copy()
+
+            if durations:
+                avg_duration = sum(durations) / len(durations)
+                total_estimated = total_sweeps * avg_duration + max(total_sweeps - 1, 0) * wait_seconds
+                msg = (
+                    f"Estimated sweep time based on measured average:\n\n"
+                    f"Average per sweep: {avg_duration:.2f} s\n"
+                    f"Total sweeps: {total_sweeps}\n"
+                    f"Wait between sweeps: {wait_seconds:.2f} s\n"
+                    f"Estimated total automatic run: {total_estimated:.2f} s"
+                )
+            else:
+                msg = (
+                    "No completed sweep yet, so exact sweep duration is not known.\n\n"
+                    "Run one sweep first, then this button will estimate:\n"
+                    "- time per sweep\n"
+                    "- total automatic sweep time"
+                )
+
+            messagebox.showinfo("Automatic Sweep Estimate", msg)
+
+        except Exception as e:
+            messagebox.showerror("Estimate Error", str(e))
+
     def update_plot(self):
         with self.data_lock:
             freq = None if self.freq is None else self.freq.copy()
             power = None if self.power is None else self.power.copy()
-            maxhold = None if self.maxhold is None else self.maxhold.copy()
 
         if freq is not None and power is not None:
-            if self.mode.get() == "Raw":
-                self.raw_line.set_data(freq, power)
-                self.raw_line.set_visible(True)
-                self.max_line.set_visible(False)
-                y = power
-            else:
-                if maxhold is not None:
-                    self.max_line.set_data(freq, maxhold)
-                    self.raw_line.set_visible(False)
-                    self.max_line.set_visible(True)
-                    y = maxhold
-                else:
-                    self.raw_line.set_data(freq, power)
-                    self.raw_line.set_visible(True)
-                    self.max_line.set_visible(False)
-                    y = power
+            self.raw_line.set_data(freq, power)
+            self.raw_line.set_visible(True)
 
             self.ax.set_xlim(freq[0], freq[-1])
 
-            ymin = float(np.min(y)) - 5
-            ymax = float(np.max(y)) + 5
+            ymin = float(np.min(power)) - 5
+            ymax = float(np.max(power)) + 5
 
             if ymin == ymax:
                 ymin -= 1
@@ -402,42 +806,28 @@ class RTPlotter:
 
         self.root.after(100, self.update_plot)
 
-    def _run_capture_command(self, cmd):
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "capture command failed")
-
-    def _save_sweep_excel(self, filepath_base, freq, power, maxhold):
+    def save_single_snapshot_excel(self, filepath_base, freq, power):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "SweepData"
 
         sheet["A1"] = "Frequency_Hz"
         sheet["B1"] = "Power_dBm"
-        sheet["C1"] = "MaxHold_dBm"
-        sheet["D1"] = "Export_Timestamp"
-        sheet["E1"] = "Scan_Count"
+        sheet["C1"] = "Export_Timestamp"
+        sheet["D1"] = "Scan_Count"
 
         export_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for idx, f in enumerate(freq, start=2):
             sheet.cell(row=idx, column=1, value=float(f))
             sheet.cell(row=idx, column=2, value=float(power[idx - 2]))
-            if maxhold is not None and len(maxhold) == len(freq):
-                sheet.cell(row=idx, column=3, value=float(maxhold[idx - 2]))
-            sheet.cell(row=idx, column=4, value=export_time)
-            sheet.cell(row=idx, column=5, value=int(self.scan_count))
+            sheet.cell(row=idx, column=3, value=export_time)
+            sheet.cell(row=idx, column=4, value=int(self.scan_count))
 
         sheet.column_dimensions["A"].width = 18
         sheet.column_dimensions["B"].width = 14
-        sheet.column_dimensions["C"].width = 14
-        sheet.column_dimensions["D"].width = 22
-        sheet.column_dimensions["E"].width = 12
+        sheet.column_dimensions["C"].width = 22
+        sheet.column_dimensions["D"].width = 12
 
         excel_path = filepath_base + ".xlsx"
         workbook.save(excel_path)
@@ -445,125 +835,37 @@ class RTPlotter:
 
     def take_snapshot(self):
         try:
-            self.root.update_idletasks()
-            self.root.update()
-
             with self.data_lock:
                 freq = None if self.freq is None else self.freq.copy()
                 power = None if self.power is None else self.power.copy()
-                maxhold = None if self.maxhold is None else self.maxhold.copy()
                 scan_count = self.scan_count
 
             if freq is None or power is None:
                 raise RuntimeError("No sweep data available yet")
 
-            x = int(self.root.winfo_rootx())
-            y = int(self.root.winfo_rooty())
-            w = int(self.root.winfo_width())
-            h = int(self.root.winfo_height())
-
-            if w <= 1 or h <= 1:
-                raise RuntimeError("Invalid window size")
-
             script_dir = os.path.dirname(os.path.abspath(__file__))
             base_name = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             image_path = os.path.join(script_dir, base_name + ".png")
 
-            errors = []
+            fig = Figure(figsize=(10, 5))
+            ax = fig.add_subplot(111)
+            ax.plot(freq, power, label="Sweep")
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel("dBm")
+            ax.set_title(f"Snapshot | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            ax.grid(True)
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(image_path, dpi=150)
 
-            if shutil.which("import"):
-                try:
-                    self._run_capture_command([
-                        "import",
-                        "-window", "root",
-                        "-crop", f"{w}x{h}+{x}+{y}",
-                        image_path
-                    ])
-                    excel_path = self._save_sweep_excel(
-                        os.path.join(script_dir, base_name),
-                        freq,
-                        power,
-                        maxhold
-                    )
-                    self.status.set(
-                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
-                    )
-                    return
-                except Exception as e:
-                    errors.append(f"import: {e}")
+            excel_path = self.save_single_snapshot_excel(
+                os.path.join(script_dir, base_name),
+                freq,
+                power
+            )
 
-            if shutil.which("gnome-screenshot"):
-                try:
-                    self._run_capture_command([
-                        "gnome-screenshot",
-                        "-f",
-                        image_path
-                    ])
-                    excel_path = self._save_sweep_excel(
-                        os.path.join(script_dir, base_name),
-                        freq,
-                        power,
-                        maxhold
-                    )
-                    self.status.set(
-                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
-                    )
-                    return
-                except Exception as e:
-                    errors.append(f"gnome-screenshot: {e}")
-
-            if shutil.which("grim"):
-                try:
-                    self._run_capture_command([
-                        "grim",
-                        "-g",
-                        f"{x},{y} {w}x{h}",
-                        image_path
-                    ])
-                    excel_path = self._save_sweep_excel(
-                        os.path.join(script_dir, base_name),
-                        freq,
-                        power,
-                        maxhold
-                    )
-                    self.status.set(
-                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
-                    )
-                    return
-                except Exception as e:
-                    errors.append(f"grim: {e}")
-
-            if shutil.which("spectacle"):
-                try:
-                    self._run_capture_command([
-                        "spectacle",
-                        "-b",
-                        "-n",
-                        "-o",
-                        image_path
-                    ])
-                    excel_path = self._save_sweep_excel(
-                        os.path.join(script_dir, base_name),
-                        freq,
-                        power,
-                        maxhold
-                    )
-                    self.status.set(
-                        f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
-                    )
-                    return
-                except Exception as e:
-                    errors.append(f"spectacle: {e}")
-
-            raise RuntimeError(
-                "No working screenshot tool found.\n\n"
-                "Install one of these system tools:\n"
-                "sudo apt install imagemagick\n"
-                "or\n"
-                "sudo apt install gnome-screenshot\n"
-                "or on Wayland:\n"
-                "sudo apt install grim\n\n"
-                "Details:\n" + "\n".join(errors)
+            self.status.set(
+                f"Snapshot saved: {image_path} | Excel saved: {excel_path} | scan {scan_count}"
             )
 
         except Exception as e:
